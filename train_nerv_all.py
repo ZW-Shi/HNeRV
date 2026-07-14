@@ -411,8 +411,8 @@ def train(local_rank, args):
                 args.loss_reg = float(np.mean(loss_reg_hist)) if loss_reg_hist else 0.
                 args.loss_total = float(np.mean(loss_total_hist)) if loss_total_hist else 0.
                 args.train_its = float(np.mean(it_s_hist)) if it_s_hist else 0.
-                Dump2CSV(args, best_metric_list, results_list, psnr_list, f'epoch{epoch+1}.csv')
                 torch.save(save_checkpoint, f'{args.outf}/epoch{epoch+1}.pth')
+                Dump2CSV(args, best_metric_list, results_list, psnr_list, f'epoch{epoch+1}.csv')
                 if best_metric_list[0]==results_list[0]:
                     torch.save(save_checkpoint, f'{args.outf}/model_best.pth')
 

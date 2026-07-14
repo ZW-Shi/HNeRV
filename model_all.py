@@ -271,6 +271,8 @@ class TemporalFactorNet(nn.Module):
     def _normalize_time(self, time_idx):
         if not torch.is_floating_point(time_idx):
             time_idx = time_idx.float() / max(self.total_frames - 1, 1)
+        else:
+            time_idx = time_idx.float()
         return time_idx.clamp(0, 1)
 
     def forward(self, time_idx):

@@ -40,20 +40,41 @@ import glob
 import pandas as pd
 
 rows = []
-for run_dir in sorted(glob.glob('output/nlrt_ablation/*')):
-    csv_candidates = sorted(glob.glob(os.path.join(run_dir, '**', 'epoch*.csv'), recursive=True))
+for csv_path in sorted(glob.glob('output/debug/bunny/**/epoch*.csv', recursive=True)):
+    run_name = os.path.basename(os.path.dirname(csv_path))
+    if not any(tag in run_name for tag in ['_baseline', '_nlrt_r8', '_nlrt_r16', '_nlrt_r32', '_nlrt_r16_t0', '_nlrt_r16_t1e4', '_nlrt_r16_t1e3']):
+        continue
+    csv_candidates = [csv_path]
     if not csv_candidates:
         continue
-    csv_path = csv_candidates[-1]
     df = pd.read_csv(csv_path)
     row = df.iloc[0].to_dict()
-    row['run_name'] = os.path.basename(run_dir)
+    ckpt_path = os.path.join(os.path.dirname(csv_path), f"epoch{int(row.get('CurEpoch', 1))}.pth")
+    if os.path.isfile(ckpt_path):
+        row['checkpoint_size_mb'] = os.path.getsize(ckpt_path) / (1024 * 1024)
+    if run_name.endswith('_baseline'):
+        row['run_name'] = 'baseline'
+    elif run_name.endswith('_nlrt_r8'):
+        row['run_name'] = 'nlrt_r8'
+    elif run_name.endswith('_nlrt_r16'):
+        row['run_name'] = 'nlrt_r16'
+    elif run_name.endswith('_nlrt_r32'):
+        row['run_name'] = 'nlrt_r32'
+    elif run_name.endswith('_nlrt_r16_t0'):
+        row['run_name'] = 'nlrt_r16_t0'
+    elif run_name.endswith('_nlrt_r16_t1e4'):
+        row['run_name'] = 'nlrt_r16_t1e4'
+    elif run_name.endswith('_nlrt_r16_t1e3'):
+        row['run_name'] = 'nlrt_r16_t1e3'
+    else:
+        continue
     rows.append(row)
 
 if not rows:
     raise RuntimeError('No run results found to summarize.')
 
 out = pd.DataFrame(rows)
+out = out.sort_values('run_name')
 keep_cols = [
     'run_name', 'repr_type', 'nlrt_rank', 'nlrt_lambda_t', 'pred_seen_psnr', 'pred_seen_ssim', 'lpips',
     'param_count_m', 'checkpoint_size_mb', 'decode_ms_per_frame', 'train_it_per_s',
@@ -62,6 +83,7 @@ keep_cols = [
 for c in keep_cols:
     if c not in out.columns:
         out[c] = 'N/A'
+out['lpips'] = out['lpips'].fillna('N/A')
 out = out[keep_cols]
 out.to_csv('results/nlrt_ablation.csv', index=False)
 print('Saved results/nlrt_ablation.csv')
