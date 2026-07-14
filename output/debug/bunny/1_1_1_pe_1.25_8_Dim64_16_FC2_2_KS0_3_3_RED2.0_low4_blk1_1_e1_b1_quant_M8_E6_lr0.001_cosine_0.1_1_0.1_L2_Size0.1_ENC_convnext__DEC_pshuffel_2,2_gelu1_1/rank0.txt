@@ -1,0 +1,35 @@
+HNeRV(
+  (pe_embed): PositionEncoding()
+  (encoder): Identity()
+  (decoder): ModuleList(
+    (0): NeRVBlock(
+      (conv): DownConv(
+        (downconv): Conv2d(16, 260, kernel_size=(1, 1), stride=(1, 1))
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+    (1): NeRVBlock(
+      (conv): UpConv(
+        (upconv): Sequential(
+          (0): Conv2d(65, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): PixelShuffle(upscale_factor=2)
+        )
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+    (2): NeRVBlock(
+      (conv): UpConv(
+        (upconv): Sequential(
+          (0): Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): PixelShuffle(upscale_factor=2)
+        )
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+  )
+  (head_layer): Conv2d(16, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+)
+Encoder_0.0M_Decoder_0.1M_Total_0.1M

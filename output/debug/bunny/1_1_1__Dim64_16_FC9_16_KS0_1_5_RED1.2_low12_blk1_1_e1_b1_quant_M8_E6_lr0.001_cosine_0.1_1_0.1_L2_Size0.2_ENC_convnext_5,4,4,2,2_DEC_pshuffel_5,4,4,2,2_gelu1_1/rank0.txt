@@ -1,0 +1,109 @@
+HNeRV(
+  (encoder): ConvNeXt(
+    (downsample_layers): ModuleList(
+      (0): Sequential(
+        (0): Conv2d(3, 64, kernel_size=(5, 5), stride=(5, 5))
+        (1): LayerNorm()
+      )
+      (1-2): 2 x Sequential(
+        (0): LayerNorm()
+        (1): Conv2d(64, 64, kernel_size=(4, 4), stride=(4, 4))
+      )
+      (3): Sequential(
+        (0): LayerNorm()
+        (1): Conv2d(64, 64, kernel_size=(2, 2), stride=(2, 2))
+      )
+      (4): Sequential(
+        (0): LayerNorm()
+        (1): Conv2d(64, 16, kernel_size=(2, 2), stride=(2, 2))
+      )
+    )
+    (stages): ModuleList(
+      (0-3): 4 x Sequential(
+        (0): Block(
+          (dwconv): Conv2d(64, 64, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3), groups=64)
+          (norm): LayerNorm()
+          (pwconv1): Linear(in_features=64, out_features=256, bias=True)
+          (act): GELU(approximate='none')
+          (pwconv2): Linear(in_features=256, out_features=64, bias=True)
+          (drop_path): Identity()
+        )
+      )
+      (4): Sequential(
+        (0): Block(
+          (dwconv): Conv2d(16, 16, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3), groups=16)
+          (norm): LayerNorm()
+          (pwconv1): Linear(in_features=16, out_features=64, bias=True)
+          (act): GELU(approximate='none')
+          (pwconv2): Linear(in_features=64, out_features=16, bias=True)
+          (drop_path): Identity()
+        )
+      )
+    )
+  )
+  (decoder): ModuleList(
+    (0): NeRVBlock(
+      (conv): DownConv(
+        (downconv): Conv2d(16, 23, kernel_size=(1, 1), stride=(1, 1))
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+    (1): NeRVBlock(
+      (conv): UpConv(
+        (upconv): Sequential(
+          (0): Conv2d(23, 475, kernel_size=(1, 1), stride=(1, 1))
+          (1): PixelShuffle(upscale_factor=5)
+        )
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+    (2): NeRVBlock(
+      (conv): UpConv(
+        (upconv): Sequential(
+          (0): Conv2d(19, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (1): PixelShuffle(upscale_factor=4)
+        )
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+    (3): NeRVBlock(
+      (conv): UpConv(
+        (upconv): Sequential(
+          (0): Conv2d(16, 208, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2))
+          (1): PixelShuffle(upscale_factor=4)
+        )
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+    (4): NeRVBlock(
+      (conv): UpConv(
+        (upconv): Sequential(
+          (0): Conv2d(13, 48, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2))
+          (1): PixelShuffle(upscale_factor=2)
+        )
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+    (5): NeRVBlock(
+      (conv): UpConv(
+        (upconv): Sequential(
+          (0): Conv2d(12, 48, kernel_size=(5, 5), stride=(1, 1), padding=(2, 2))
+          (1): PixelShuffle(upscale_factor=2)
+        )
+      )
+      (norm): Identity()
+      (act): GELU(approximate='none')
+    )
+  )
+  (head_layer): Conv2d(12, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+)
+Encoder_0.31M_Decoder_0.17M_Total_0.19M
+[2026/07/14 08:02:55] Rank:None, Epoch[1/1], Step [1/132], lr:1.00e-04 pred_PSNR: 11.47
+[2026/07/14 08:03:03] Rank:None, Eval at Step [1/132] , FPS 7.1, pred_seen_psnr: 11.21 | 
+[2026/07/14 08:03:06] Rank:None, Eval at Step [1/132] , FPS 7.1, quant_seen_psnr: 11.21 | 
+Eval at epoch 1 for (640, 1280): pred_seen_psnr: 11.31 | pred_unseen_psnr: 0.0 | quant_seen_psnr: 11.31 | quant_unseen_psnr: 0.0 | 
