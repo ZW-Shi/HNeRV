@@ -90,6 +90,65 @@ Specify decoder and checkpoint by ```'--decoder [Decoder_path] --ckt [Video chec
 python efficient_nvloader.py --frames 16
 ```
 
+## Neural Low-Rank Tensor Representation (NLRT)
+
+NLRT replaces the intermediate video feature map with a neural CP low-rank tensor field:
+\[
+\mathcal{F}(t,h,w,c)=\sum_{r=1}^{R} A_\theta(t,r)\,B_\phi(h,r)\,D_\psi(w,r)\,E_\omega(c,r)
+\]
+where \(A_\theta\) is a temporal factor network (with temporal PE + MLP), \(B_\phi,D_\psi\) are spatial factors (parameter tables or optional spatial MLP), and \(E_\omega\) is a channel factor matrix.
+
+### New arguments
+- `--repr_type`: `baseline|nlrt` (default `baseline`)
+- `--nlrt_rank`: CP rank `R` (default `0`, i.e. fallback to baseline path)
+- `--nlrt_h0`, `--nlrt_w0`, `--nlrt_c`: NLRT field shape
+- `--nlrt_t_pe`: temporal PE config (`base_levels`, e.g. `1.25_16`)
+- `--nlrt_lambda_t`: temporal smoothness loss weight
+- `--nlrt_lambda_reg`: factor regularization loss weight
+- `--nlrt_use_spatial_mlp`: use spatial coordinate MLP (`0/1`)
+
+### Minimal run commands
+Baseline (original path):
+```bash
+python train_nerv_all.py --data_path data/bunny --vid bunny \
+  --conv_type convnext pshuffel --act gelu --norm none \
+  --crop_list 640_1280 --resize_list -1 --loss L2 \
+  --enc_strds 5 4 4 2 2 --enc_dim 64_16 \
+  --dec_strds 5 4 4 2 2 --ks 0_1_5 --reduce 1.2 \
+  --modelsize 0.2 -e 1 --eval_freq 1 --lower_width 12 -b 1 --workers 0 --debug
+```
+
+NLRT:
+```bash
+python train_nerv_all.py --data_path data/bunny --vid bunny \
+  --conv_type convnext pshuffel --act gelu --norm none \
+  --crop_list 640_1280 --resize_list -1 --loss L2 \
+  --enc_strds 5 4 4 2 2 --enc_dim 64_16 \
+  --dec_strds 5 4 4 2 2 --ks 0_1_5 --reduce 1.2 \
+  --modelsize 0.2 -e 1 --eval_freq 1 --lower_width 12 -b 1 --workers 0 --debug \
+  --repr_type nlrt --nlrt_rank 16 --nlrt_h0 2 --nlrt_w0 4 --nlrt_c 16 \
+  --nlrt_t_pe 1.25_16 --nlrt_lambda_t 1e-4 --nlrt_lambda_reg 1e-6
+```
+
+### One-click ablation
+```bash
+bash scripts/ablate_nlrt.sh
+```
+This writes per-run logs into `logs/` and an aggregated table into `results/nlrt_ablation.csv`.
+
+### Reproducibility notes
+- Training seeds are fixed for Python / NumPy / PyTorch.
+- `cudnn.deterministic=True` and `cudnn.benchmark=False` are enabled for reproducibility (typically slower than non-deterministic settings).
+- CSV outputs include environment info and Git commit hash.
+
+### Example result table (see `results/nlrt_ablation.csv`)
+| run_name | repr_type | nlrt_rank | pred_seen_psnr | pred_seen_ssim | lpips | param_count_m | checkpoint_size_mb | decode_ms_per_frame |
+|---|---|---:|---:|---:|---|---:|---:|---:|
+| baseline | baseline | 0 | 11.31 | 0.3189 | N/A | 0.4758 | 5.5283 | 139.63 |
+| nlrt_r8 | nlrt | 8 | 11.06 | 0.3185 | N/A | 0.4773 | 3.1681 | 147.59 |
+| nlrt_r16 | nlrt | 16 | 11.58 | 0.3195 | N/A | 0.4778 | 3.1732 | 143.42 |
+| nlrt_r32 | nlrt | 32 | 11.56 | 0.3195 | N/A | 0.4808 | 3.2075 | 142.55 |
+
 ## Citation
 If you find our work useful in your research, please cite:
 ```
