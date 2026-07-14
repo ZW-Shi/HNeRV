@@ -102,6 +102,8 @@ class HNeRV(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.embed = args.embed
+        self.repr_type = getattr(args, 'repr_type', 'baseline')
+        self.nlrt_rank = getattr(args, 'nlrt_rank', 0)
         ks_enc, ks_dec1, ks_dec2 = [int(x) for x in args.ks.split('_')]
         enc_blks, dec_blks = [int(x) for x in args.num_blks.split('_')]
 
@@ -129,6 +131,21 @@ class HNeRV(nn.Module):
             self.encoder = nn.Identity()
             self.fc_h, self.fc_w = [int(x) for x in args.fc_hw.split('_')]
 
+        self.nlrt_field = None
+        if self.repr_type == 'nlrt' and self.nlrt_rank > 0:
+            nlrt_c = args.nlrt_c if args.nlrt_c > 0 else ch_in
+            if nlrt_c != ch_in:
+                raise ValueError(f'nlrt_c ({nlrt_c}) must match decoder input channels ({ch_in}).')
+            self.nlrt_field = NeuralLowRankVideoField(
+                rank=self.nlrt_rank,
+                h0=args.nlrt_h0,
+                w0=args.nlrt_w0,
+                c=nlrt_c,
+                t_pe=args.nlrt_t_pe,
+                use_spatial_mlp=bool(args.nlrt_use_spatial_mlp),
+                total_frames=getattr(args, 'full_data_length', 1),
+            )
+
         # BUILD Decoder LAYERS  
         decoder_layers = []        
         ngf = args.fc_dim
@@ -152,6 +169,8 @@ class HNeRV(nn.Module):
     def forward(self, input, input_embed=None, encode_only=False):
         if input_embed != None:
             img_embed = input_embed
+        elif self.repr_type == 'nlrt' and self.nlrt_field is not None:
+            img_embed = self.nlrt_field(input)
         else:
             if 'pe' in self.embed:
                 input = self.pe_embed(input[:,None]).float()
@@ -174,6 +193,15 @@ class HNeRV(nn.Module):
         dec_time = time.time() - dec_start
 
         return  img_out, embed_list, dec_time
+
+    def nlrt_losses(self, time_idx, device):
+        zero = torch.zeros((), device=device)
+        if self.repr_type != 'nlrt' or self.nlrt_field is None:
+            return {'loss_temp': zero, 'loss_reg': zero}
+        return {
+            'loss_temp': self.nlrt_field.temporal_smoothness_loss(time_idx),
+            'loss_reg': self.nlrt_field.regularization_loss(),
+        }
 
 
 class HNeRVDecoder(nn.Module):
@@ -211,6 +239,98 @@ class PositionEncoding(nn.Module):
             return pe_embed.view(pos.size(0), -1, 1, 1)
         else:
             return pos
+
+
+class TemporalFactorNet(nn.Module):
+    def __init__(self, rank, t_pe='1.25_16', total_frames=1):
+        super().__init__()
+        self.rank = rank
+        self.total_frames = max(int(total_frames), 1)
+        self.base, self.levels = self._parse_t_pe(t_pe)
+        if self.levels > 0:
+            self.register_buffer('pe_bases', (self.base ** torch.arange(self.levels).float()) * pi)
+            in_dim = 1 + 2 * self.levels
+        else:
+            in_dim = 1
+        hidden = max(32, rank * 2)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, rank),
+        )
+
+    @staticmethod
+    def _parse_t_pe(t_pe):
+        if isinstance(t_pe, (int, float)):
+            return 2.0, int(t_pe)
+        if '_' in str(t_pe):
+            base, levels = str(t_pe).split('_')[:2]
+            return float(base), int(levels)
+        return 2.0, int(t_pe)
+
+    def _normalize_time(self, time_idx):
+        if not torch.is_floating_point(time_idx):
+            time_idx = time_idx.float() / max(self.total_frames - 1, 1)
+        return time_idx.clamp(0, 1)
+
+    def forward(self, time_idx):
+        time_idx = self._normalize_time(time_idx).view(-1, 1)
+        if self.levels > 0:
+            value_list = time_idx * self.pe_bases.to(time_idx.device)
+            pe = torch.cat([torch.sin(value_list), torch.cos(value_list)], dim=-1)
+            feat = torch.cat([time_idx, pe], dim=-1)
+        else:
+            feat = time_idx
+        return self.mlp(feat)
+
+
+class NeuralLowRankVideoField(nn.Module):
+    def __init__(self, rank, h0, w0, c, t_pe='1.25_16', use_spatial_mlp=False, total_frames=1):
+        super().__init__()
+        self.rank, self.h0, self.w0, self.c = rank, h0, w0, c
+        self.use_spatial_mlp = use_spatial_mlp
+        scale = 1.0 / sqrt(max(rank, 1))
+        self.temporal_net = TemporalFactorNet(rank, t_pe=t_pe, total_frames=total_frames)
+        self.E = nn.Parameter(torch.randn(c, rank) * scale)
+        if use_spatial_mlp:
+            self.h_mlp = nn.Sequential(nn.Linear(1, 64), nn.GELU(), nn.Linear(64, rank))
+            self.w_mlp = nn.Sequential(nn.Linear(1, 64), nn.GELU(), nn.Linear(64, rank))
+            self.register_buffer('h_coords', torch.linspace(0, 1, steps=h0).view(-1, 1))
+            self.register_buffer('w_coords', torch.linspace(0, 1, steps=w0).view(-1, 1))
+        else:
+            self.B = nn.Parameter(torch.randn(h0, rank) * scale)
+            self.D = nn.Parameter(torch.randn(w0, rank) * scale)
+
+    def _spatial_factors(self):
+        if self.use_spatial_mlp:
+            b = self.h_mlp(self.h_coords.to(self.E.device))
+            d = self.w_mlp(self.w_coords.to(self.E.device))
+            return b, d
+        return self.B, self.D
+
+    def forward(self, time_idx):
+        A = self.temporal_net(time_idx)
+        B, D = self._spatial_factors()
+        field = torch.einsum('nr,hr,wr,cr->nhwc', A, B, D, self.E)
+        return field.permute(0, 3, 1, 2).contiguous()
+
+    def regularization_loss(self):
+        reg = self.E.pow(2).mean()
+        if self.use_spatial_mlp:
+            for p in self.h_mlp.parameters():
+                reg = reg + p.pow(2).mean()
+            for p in self.w_mlp.parameters():
+                reg = reg + p.pow(2).mean()
+        else:
+            reg = reg + self.B.pow(2).mean() + self.D.pow(2).mean()
+        return reg
+
+    def temporal_smoothness_loss(self, time_idx):
+        if time_idx.numel() <= 1:
+            return torch.zeros((), device=self.E.device)
+        sorted_idx = torch.sort(time_idx.view(-1))[0]
+        A = self.temporal_net(sorted_idx)
+        return (A[1:] - A[:-1]).pow(2).mean()
 
 
 class Sin(nn.Module):

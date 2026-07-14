@@ -4,6 +4,9 @@ import argparse
 import os
 import random
 import shutil
+import subprocess
+import platform
+import time
 from datetime import datetime
 import numpy as np
 import csv
@@ -40,6 +43,16 @@ def main():
     parser.add_argument('--enc_dim', type=str, default='64_16', help='enc latent dim and embedding ratio')
     parser.add_argument('--modelsize', type=float,  default=1.5, help='model parameters size: model size + embedding parameters')
     parser.add_argument('--saturate_stages', type=int, default=-1, help='saturate stages for model size computation')
+    parser.add_argument('--repr_type', type=str, default='baseline', choices=['baseline', 'nlrt'],
+        help='video representation type: baseline encoder features or neural low-rank tensor representation')
+    parser.add_argument('--nlrt_rank', type=int, default=0, help='CP rank R for NLRT, set 0 to disable NLRT')
+    parser.add_argument('--nlrt_h0', type=int, default=2, help='NLRT field height H0')
+    parser.add_argument('--nlrt_w0', type=int, default=4, help='NLRT field width W0')
+    parser.add_argument('--nlrt_c', type=int, default=-1, help='NLRT channel C, -1 means match decoder input channels')
+    parser.add_argument('--nlrt_t_pe', type=str, default='1.25_16', help='temporal positional encoding config for NLRT (base_levels)')
+    parser.add_argument('--nlrt_lambda_t', type=float, default=0., help='weight for NLRT temporal smoothness loss')
+    parser.add_argument('--nlrt_lambda_reg', type=float, default=0., help='weight for NLRT factor regularization loss')
+    parser.add_argument('--nlrt_use_spatial_mlp', type=int, default=0, choices=[0, 1], help='use spatial coordinate MLP for NLRT B/D factors')
 
     # Decoding parameters: FC + Conv
     parser.add_argument('--fc_hw', type=str, default='9_16', help='out size (h,w) for mlp')
@@ -90,6 +103,8 @@ def main():
 
 
     args = parser.parse_args()
+    if args.repr_type == 'baseline':
+        args.nlrt_rank = 0
     torch.set_printoptions(precision=4) 
     if args.debug:
         args.eval_freq = 1
@@ -103,7 +118,10 @@ def main():
         '_dist' if args.distributed else '', '_shuffle_data' if args.shuffle_data else '',)
     args.quant_str = f'quant_M{args.quant_model_bit}_E{args.quant_embed_bit}'
     embed_str = f'{args.embed}_Dim{args.enc_dim}'
-    exp_id = f'{args.vid}/{args.data_split}_{embed_str}_FC{args.fc_hw}_KS{args.ks}_RED{args.reduce}_low{args.lower_width}_blk{args.num_blks}' + \
+    nlrt_str = f'_{args.repr_type}'
+    if args.repr_type == 'nlrt':
+        nlrt_str += f'_r{args.nlrt_rank}_h{args.nlrt_h0}_w{args.nlrt_w0}_c{args.nlrt_c}_pe{args.nlrt_t_pe}_lt{args.nlrt_lambda_t}_lr{args.nlrt_lambda_reg}_smlp{args.nlrt_use_spatial_mlp}'
+    exp_id = f'{args.vid}/{args.data_split}_{embed_str}_FC{args.fc_hw}_KS{args.ks}_RED{args.reduce}_low{args.lower_width}_blk{args.num_blks}{nlrt_str}' + \
             f'_e{args.epochs}_b{args.batchSize}_{args.quant_str}_lr{args.lr}_{args.lr_type}_{args.loss}_{extra_str}{args.act}{args.block_params}{args.suffix}'
     args.exp_id = exp_id
 
@@ -130,8 +148,11 @@ def data_to_gpu(x, device):
     return x.to(device)
 
 def train(local_rank, args):
-    cudnn.benchmark = True
+    cudnn.benchmark = False
+    cudnn.deterministic = True
     torch.manual_seed(args.manualSeed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.manualSeed)
     np.random.seed(args.manualSeed)
     random.seed(args.manualSeed)
 
@@ -199,6 +220,7 @@ def train(local_rank, args):
         decoder_param = (sum([p.data.nelement() for p in model.decoder.parameters()]) / 1e6) 
         total_param = decoder_param + embed_param / 1e6
         args.encoder_param, args.decoder_param, args.total_param = encoder_param, decoder_param, total_param
+        args.total_trainable_m = sum(p.numel() for p in model.parameters()) / 1e6
         param_str = f'Encoder_{round(encoder_param, 2)}M_Decoder_{round(decoder_param, 2)}M_Total_{round(total_param, 2)}M'
         print(f'{args}\n {model}\n {param_str}', flush=True)
         with open('{}/rank0.txt'.format(args.outf), 'a') as f:
@@ -274,38 +296,65 @@ def train(local_rank, args):
     start = datetime.now()
 
     psnr_list = []
+    loss_rec_hist, loss_temp_hist, loss_reg_hist, loss_total_hist, it_s_hist = [], [], [], [], []
     for epoch in range(args.start_epoch, args.epochs):
         model.train()       
         epoch_start_time = datetime.now()
         pred_psnr_list = []
+        loss_rec_list, loss_temp_list, loss_reg_list, loss_total_list = [], [], [], []
         # iterate over dataloader
         device = next(model.parameters()).device
         for i, sample in enumerate(train_dataloader):
+            iter_start = time.time()
             img_data, norm_idx, img_idx = data_to_gpu(sample['img'], device), data_to_gpu(sample['norm_idx'], device), data_to_gpu(sample['idx'], device)
             if i > 10 and args.debug:
                 break
 
             # forward and backward
             img_data, img_gt, inpaint_mask = args.transform_func(img_data)
-            cur_input = norm_idx if 'pe' in args.embed else img_data
+            if args.repr_type == 'nlrt':
+                cur_input = norm_idx
+            else:
+                cur_input = norm_idx if 'pe' in args.embed else img_data
             cur_epoch = (epoch + float(i) / len(train_dataloader)) / args.epochs
             lr = adjust_lr(optimizer, cur_epoch, args)
             img_out, _, _ = model(cur_input)
-            final_loss = loss_fn(img_out*inpaint_mask, img_gt*inpaint_mask, args.loss)      
+            loss_rec = loss_fn(img_out*inpaint_mask, img_gt*inpaint_mask, args.loss)
+            raw_model = model.module if hasattr(model, 'module') else model
+            aux_losses = raw_model.nlrt_losses(norm_idx, img_out.device)
+            loss_temp = aux_losses['loss_temp']
+            loss_reg = aux_losses['loss_reg']
+            final_loss = loss_rec + args.nlrt_lambda_t * loss_temp + args.nlrt_lambda_reg * loss_reg
             optimizer.zero_grad()
             final_loss.backward()
             optimizer.step()
 
             pred_psnr_list.append(psnr_fn_single(img_out.detach(), img_gt)) 
+            loss_rec_list.append(loss_rec.detach())
+            loss_temp_list.append(loss_temp.detach())
+            loss_reg_list.append(loss_reg.detach())
+            loss_total_list.append(final_loss.detach())
+            it_s_hist.append(1. / max(time.time() - iter_start, 1e-8))
             if i % args.print_freq == 0 or i == len(train_dataloader) - 1:
                 pred_psnr = torch.cat(pred_psnr_list).mean()
-                print_str = '[{}] Rank:{}, Epoch[{}/{}], Step [{}/{}], lr:{:.2e} pred_PSNR: {}'.format(
+                mean_loss_rec = torch.stack(loss_rec_list).mean()
+                mean_loss_temp = torch.stack(loss_temp_list).mean()
+                mean_loss_reg = torch.stack(loss_reg_list).mean()
+                mean_loss_total = torch.stack(loss_total_list).mean()
+                print_str = '[{}] Rank:{}, Epoch[{}/{}], Step [{}/{}], lr:{:.2e} pred_PSNR: {} loss_rec:{} loss_temp:{} loss_reg:{} loss_total:{}'.format(
                     datetime.now().strftime("%Y/%m/%d %H:%M:%S"), local_rank, epoch+1, args.epochs, i+1, len(train_dataloader), lr, 
-                    RoundTensor(pred_psnr, 2))
+                    RoundTensor(pred_psnr, 2), RoundTensor(mean_loss_rec.view(1), 4), RoundTensor(mean_loss_temp.view(1), 4),
+                    RoundTensor(mean_loss_reg.view(1), 4), RoundTensor(mean_loss_total.view(1), 4))
                 print(print_str, flush=True)
                 if local_rank in [0, None]:
                     with open('{}/rank0.txt'.format(args.outf), 'a') as f:
                         f.write(print_str + '\n')
+
+        if len(loss_rec_list):
+            loss_rec_hist.append(torch.stack(loss_rec_list).mean().item())
+            loss_temp_hist.append(torch.stack(loss_temp_list).mean().item())
+            loss_reg_hist.append(torch.stack(loss_reg_list).mean().item())
+            loss_total_hist.append(torch.stack(loss_total_list).mean().item())
 
         # collect numbers from other gpus
         if args.distributed and args.ngpus_per_node > 1:
@@ -316,6 +365,11 @@ def train(local_rank, args):
             h, w = img_out.shape[-2:]
             writer.add_scalar(f'Train/pred_PSNR_{h}X{w}', pred_psnr, epoch+1)
             writer.add_scalar('Train/lr', lr, epoch+1)
+            if len(loss_rec_hist):
+                writer.add_scalar('Train/loss_rec', loss_rec_hist[-1], epoch+1)
+                writer.add_scalar('Train/loss_temp', loss_temp_hist[-1], epoch+1)
+                writer.add_scalar('Train/loss_reg', loss_reg_hist[-1], epoch+1)
+                writer.add_scalar('Train/loss_total', loss_total_hist[-1], epoch+1)
             epoch_end_time = datetime.now()
             print("Time/epoch: \tCurrent:{:.2f} \tAverage:{:.2f}".format( (epoch_end_time - epoch_start_time).total_seconds(), \
                     (epoch_end_time - start).total_seconds() / (epoch + 1 - args.start_epoch) ))
@@ -352,6 +406,11 @@ def train(local_rank, args):
             if (epoch + 1) % args.epochs == 0:
                 args.cur_epoch = epoch + 1
                 args.train_time = str(datetime.now() - start)
+                args.loss_rec = float(np.mean(loss_rec_hist)) if loss_rec_hist else 0.
+                args.loss_temp = float(np.mean(loss_temp_hist)) if loss_temp_hist else 0.
+                args.loss_reg = float(np.mean(loss_reg_hist)) if loss_reg_hist else 0.
+                args.loss_total = float(np.mean(loss_total_hist)) if loss_total_hist else 0.
+                args.train_its = float(np.mean(it_s_hist)) if it_s_hist else 0.
                 Dump2CSV(args, best_metric_list, results_list, psnr_list, f'epoch{epoch+1}.csv')
                 torch.save(save_checkpoint, f'{args.outf}/epoch{epoch+1}.pth')
                 if best_metric_list[0]==results_list[0]:
@@ -363,6 +422,13 @@ def train(local_rank, args):
 
 # Writing final results in CSV file
 def Dump2CSV(args, best_results_list, results_list, psnr_list, filename='results.csv'):
+    try:
+        commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], text=True).strip()
+    except Exception:
+        commit_hash = 'N/A'
+    ckpt_path = os.path.join(args.outf, f'epoch{args.cur_epoch}.pth')
+    ckpt_size_mb = os.path.getsize(ckpt_path) / (1024 * 1024) if os.path.isfile(ckpt_path) else 0.
+    decode_ms_per_frame = (1000.0 / args.fps) if getattr(args, 'fps', 0) > 0 else 0.
     result_dict = {'Vid':args.vid, 'CurEpoch':args.cur_epoch, 'Time':args.train_time, 
         'FPS':args.fps, 'Split':args.data_split, 'Embed':args.embed, 'Crop': args.crop_list,
         'Resize':args.resize_list, 'Lr_type':args.lr_type, 'LR (E-3)': args.lr*1e3, 'Batch':args.batchSize,
@@ -371,7 +437,16 @@ def Dump2CSV(args, best_results_list, results_list, psnr_list, filename='results
         'FC':args.fc_hw, 'Reduce':args.reduce, 'ENC_type':args.conv_type[0], 'ENC_strds':args.enc_strd_str, 'KS':args.ks,
         'enc_dim':args.enc_dim, 'DEC':args.conv_type[1], 'DEC_strds':args.dec_strd_str, 'lower_width':args.lower_width,
          'Quant':args.quant_str, 'bits/param':args.bits_per_param, 'bits/param w/ overhead':args.full_bits_per_param, 
-        'bits/pixel':args.total_bpp, f'PSNR_list_{args.eval_freq}':','.join([RoundTensor(v, 2) for v in psnr_list]),}
+        'bits/pixel':args.total_bpp, f'PSNR_list_{args.eval_freq}':','.join([RoundTensor(v, 2) for v in psnr_list]),
+        'repr_type': args.repr_type, 'nlrt_rank': args.nlrt_rank, 'nlrt_h0': args.nlrt_h0, 'nlrt_w0': args.nlrt_w0,
+        'nlrt_c': args.nlrt_c, 'nlrt_t_pe': args.nlrt_t_pe, 'nlrt_lambda_t': args.nlrt_lambda_t,
+        'nlrt_lambda_reg': args.nlrt_lambda_reg, 'nlrt_use_spatial_mlp': args.nlrt_use_spatial_mlp,
+        'loss_rec': getattr(args, 'loss_rec', 0.), 'loss_temp': getattr(args, 'loss_temp', 0.),
+        'loss_reg': getattr(args, 'loss_reg', 0.), 'loss_total': getattr(args, 'loss_total', 0.),
+        'train_it_per_s': getattr(args, 'train_its', 0.), 'decode_ms_per_frame': decode_ms_per_frame,
+        'checkpoint_size_mb': ckpt_size_mb, 'param_count_m': getattr(args, 'total_trainable_m', 0.),
+        'lpips': 'N/A', 'git_commit': commit_hash, 'python': platform.python_version(),
+        'pytorch': torch.__version__, 'cuda': torch.version.cuda, 'cudnn_deterministic': True, 'cudnn_benchmark': False}
     result_dict.update({f'best_{k}':RoundTensor(v, 4 if 'ssim' in k else 2) for k,v in zip(args.metric_names, best_results_list)})
     result_dict.update({f'{k}':RoundTensor(v, 4 if 'ssim' in k else 2) for k,v in zip(args.metric_names, results_list) if 'pred' in k})
     csv_path = os.path.join(args.outf, filename)
@@ -400,7 +475,10 @@ def evaluate(model, full_dataloader, local_rank, args,
             if i > 10 and args.debug:
                 break
             img_data, img_gt, inpaint_mask = args.transform_func(img_data)
-            cur_input = norm_idx if 'pe' in args.embed else img_data
+            if args.repr_type == 'nlrt':
+                cur_input = norm_idx
+            else:
+                cur_input = norm_idx if 'pe' in args.embed else img_data
             img_out, embed_list, dec_time = cur_model(cur_input, dequant_vid_embed[i] if model_ind else None)
             if model_ind == 0:
                 img_embed_list.append(embed_list[0])
